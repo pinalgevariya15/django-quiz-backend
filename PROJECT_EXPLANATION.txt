@@ -1,0 +1,225 @@
+========================================================================
+           THE ULTIMATE CONNECTIVITY & LOGIC GUIDE FOR QUIZ BACKEND
+        (How Folders, Files, and Functions Link Together in Detail)
+========================================================================
+
+This document maps out:
+1. DIRECTORY MAP: Which folders exist and what they are used for.
+2. FILE CONNECTIONS: How files link, import, and talk to each other (with visual maps).
+3. DETAILED WORKFLOWS: Step-by-step traces of functions and data flow (e.g., how the Forgot Password code is generated and verified).
+
+---
+
+========================================================================
+                  PART 1: THE DIRECTORY MAP (Who does what?)
+========================================================================
+
+* `quiz_project/` (The Control Center)
+  - Purpose: Sets up the entire website server. It holds the main settings file and the main address directory (URLs).
+  - Who it talks to: It reaches out to both the `users` and `quiz` directories to tell them what settings to use and how to direct traffic.
+
+* `users/` (The Membership Desk)
+  - Purpose: Manages user registrations, logins, verification codes, and password changes.
+  - Who it talks to: Independent app. It doesn't need to know anything about the `quiz` folder, but it talks to the SQLite Database.
+
+* `quiz/` (The Game Room)
+  - Purpose: Stores quizzes, contains questions, sets up game session attempts, and computes user scores.
+  - Who it talks to: It interacts with the `users` app indirectly because every `QuizSession` needs to be linked to a `User` from the `users` app.
+
+---
+
+========================================================================
+            PART 2: FILE CONNECTIONS MAP (How files talk)
+========================================================================
+
+Here is how files are wired together. An arrow `A ---> B` means file A imports or sends data to file B.
+
+```
+                  [quiz_project/settings.py] (Global settings)
+                              |
+                              v (Dictates settings to all files)
+                  [quiz_project/urls.py] (Main Signpost)
+                     /              \
+                    /                \
+        [users/urls.py]            [quiz/urls.py]
+              |                          |
+        [users/views.py]           [quiz/views.py]
+         /           \              /           \
+        v             v            v             v
+[users/serializers.py] [users/models.py] [quiz/serializers.py] [quiz/models.py]
+        |                                        |
+        v                                        v
+ [users/models.py]                         [quiz/models.py]
+```
+
+### Explanation of Connections:
+1. `urls.py` files connect to `views.py` files. They act as triggers. When a user requests a URL path, it triggers a view function inside `views.py`.
+2. `views.py` files are the orchestrators. They import `serializers.py` to check the client inputs and `models.py` to read/write data to the database.
+3. `serializers.py` files import `models.py` to query the database (e.g., "does this email exist?") and to save updated fields back into the database.
+4. `settings.py` links to `users/exceptions.py` and `users/renderers.py` globally. This means any error or success output from either app is automatically cleaned up and formatted by these two helper files.
+
+---
+
+========================================================================
+          PART 3: FEATURE WORKFLOWS (Inside the Functions)
+========================================================================
+
+Let's look in detail at how functions in different files talk to each other to complete a task.
+
+------------------------------------------------------------------------
+JOURNEY 1: FORGOT PASSWORD & PASSWORD RESET (The Code Generation & Verification)
+------------------------------------------------------------------------
+
+This is the exact sequence of what happens when a user requests a code and resets their password:
+
+### Phase A: Requesting a Code (Forgot Password)
+
+1. [User Request]
+   - The user inputs `{"email": "test@example.com"}` in Swagger and sends it to `POST /api/auth/forgot-password/`.
+
+2. [Routing]
+   - `quiz_project/urls.py` forwards the path to `users/urls.py`, which triggers `ForgotPasswordView` in `users/views.py`.
+
+3. [Handling the View]
+   - Function: `ForgotPasswordView.post(self, request)`
+     - Step 1: It loads the user inputs and passes them to `ForgotPasswordSerializer(data=request.data)`.
+     - Step 2: It calls `.is_valid(raise_exception=True)`. This jumps to `ForgotPasswordSerializer` validation.
+
+4. [Validating the Input]
+   - Function: `ForgotPasswordSerializer.validate_email(self, value)`
+     - Step 1: Checks the database: `User.objects.filter(email=email).exists()`.
+     - Step 2: If the email doesn't exist in the database, it throws a "No user registered" error. If it exists, it returns the email.
+
+5. [Generating the Code]
+   - Returning to: `ForgotPasswordView.post`
+     - Step 1: Fetches the User model instance: `user = User.objects.get(email=email)`.
+     - Step 2: Generates a random code using Python's standard library: `code = f"{random.randint(100000, 999999)}"`. (For example: `"719402"`).
+     - Step 3: Saves this code into the Database by creating a `PasswordResetCode` model entry:
+       ```python
+       PasswordResetCode.objects.create(user=user, code=code)
+       ```
+       This records the user ID, the code, the current time (`created_at`), and sets `is_used = False` in the SQL database table.
+
+6. [Sending the Email]
+   - `ForgotPasswordView.post` calls Django's `send_mail()` function. Since settings.py is configured to use the Console email backend, the mail containing the code `"719402"` prints directly in your running terminal.
+   - If `DEBUG = True` (development mode), the view packs the code into a debug response dictionary: `response_data["_debug"] = {"code": code}`.
+   - Returns the response to the user.
+
+---
+
+### Phase B: Resetting the Password
+
+1. [User Request]
+   - The user inputs:
+     ```json
+     {
+       "email": "test@example.com",
+       "code": "719402",
+       "password": "NewStrongPassword123!"
+     }
+     ```
+   - Sends it to `POST /api/auth/reset-password/`.
+
+2. [Routing]
+   - Triggers `ResetPasswordView` in `users/views.py`.
+
+3. [Handling the View]
+   - Function: `ResetPasswordView.post(self, request)`
+     - Step 1: It loads the inputs and passes them to `ResetPasswordSerializer(data=request.data)`.
+     - Step 2: Calls `serializer.is_valid(raise_exception=True)`.
+
+4. [Checking the Code Logic]
+   - Function: `ResetPasswordSerializer.validate(self, data)`
+     - Step 1: It searches the database for the user: `User.objects.get(email=email)`.
+     - Step 2: It retrieves the latest code entry created for this user:
+       ```python
+       reset_code = PasswordResetCode.objects.filter(user=user).order_by('-created_at').first()
+       ```
+     - Step 3: It performs 4 validation checks:
+       * Check 1: Does a code exist? (If not, raises `"No password reset code has been requested."`)
+       * Check 2: Has it already been used? (If `reset_code.is_used` is True, raises `"This verification code has already been used."`)
+       * Check 3: Has it expired? Calls `reset_code.is_expired()`.
+         - Function: `PasswordResetCode.is_expired(self)` compares: `timezone.now() > created_at + 15 minutes`. If yes, raises `"This verification code has expired."`
+       * Check 4: Does it match the user's input? (If `reset_code.code != code`, raises `"Invalid verification code."`)
+     - Step 4: Checks the strength of the new password: `validate_password(password, user=user)`.
+     - Step 5: Temporarily saves the `user` and `reset_code` instances inside the serializer's memory context.
+
+5. [Saving the New Password]
+   - Returning to: `ResetPasswordView.post`
+     - Step 1: Calls `serializer.save()`.
+     - Step 2: Inside `ResetPasswordSerializer.save()`, the function:
+       * Calls `user.set_password(password)` (encrypts the new password).
+       * Calls `user.save()` (writes the new password into the database).
+       * Sets `reset_code.is_used = True` and calls `reset_code.save()` (writes the used status into the database, disabling the code).
+     - Step 3: Returns a success message response: `{"message": "Your password has been successfully reset."}`.
+
+---
+
+------------------------------------------------------------------------
+JOURNEY 2: STARTING A QUIZ & SUBMITTING ANSWERS (The Game Flow)
+------------------------------------------------------------------------
+
+### Phase A: Starting the Quiz
+
+1. [User Request]
+   - A logged-in user sends a request to `GET /api/quiz/1/start/`.
+
+2. [Routing]
+   - Triggers `QuizStartView` in `quiz/views.py`.
+
+3. [Handling the View]
+   - Function: `QuizStartView.get(self, request, id)`
+     - Step 1: Looks up the Quiz: `quiz = get_object_or_404(Quiz, pk=id)`.
+     - Step 2: Checks if the user is already playing this quiz:
+       ```python
+       session = QuizSession.objects.filter(user=request.user, quiz=quiz, is_completed=False).first()
+       ```
+     - Step 3: If no active session exists:
+       * Creates a new database row in `QuizSession` for the user.
+       * Selects 10 random questions: `Question.objects.filter(quiz=quiz).order_by('?')[:10]`.
+       * Associates these 10 questions to the `QuizSession` model in the database (`session.questions.set(random_questions)`).
+     - Step 4: Passes the session data to `QuizStartSerializer`. The serializer outputs the `session_id`, `quiz_title`, and the list of 10 questions (excluding the correct answer option field so players can't cheat!).
+     - Step 5: Returns the session details and questions.
+
+---
+
+### Phase B: Submitting Answers
+
+1. [User Request]
+   - User sends a POST request with the list of answers to `/api/quiz/1/submit/`.
+     ```json
+     {
+       "answers": [
+         { "question_id": 15, "selected_option": 3 },
+         { "question_id": 18, "selected_option": 1 }
+       ]
+     }
+     ```
+
+2. [Routing]
+   - Triggers `QuizSubmitView` in `quiz/views.py`.
+
+3. [Handling the View]
+   - Function: `QuizSubmitView.post(self, request, id)`
+     - Step 1: Finds the incomplete active session.
+     - Step 2: Passes the session and the answers payload to `QuizSubmitSerializer(data=request.data, context={"session": session})`.
+     - Step 3: Calls `is_valid()` to check for empty answers or already-completed sessions.
+     - Step 4: Calls `serializer.save()`.
+
+4. [Calculating Scores & Saving]
+   - Function: `QuizSubmitSerializer.save(self)`
+     - Step 1: Loads all 10 questions belonging to the active session.
+     - Step 2: Loops through each submitted answer:
+       - Confirms the question belongs to this quiz.
+       - Compares the `selected_option` (e.g. `3`) to the correct option stored on the Question model (`question.correct_option`).
+       - If they match, adds `+1` to the `score` counter.
+       - Packs a `UserAnswer` record for each question.
+     - Step 3: Deletes any old answer records for safety and runs `UserAnswer.objects.bulk_create()` to write the answers to the database in a single step.
+     - Step 4: Updates the `session` details: `score = score`, `is_completed = True`, `completed_at = timezone.now()`. Saves the session.
+     - Step 5: Compiles a report containing the final score, total questions count, percentages, and a breakdown of which answers were correct or incorrect.
+     - Step 6: Returns this report to `QuizSubmitView`.
+
+5. [Outputting Result]
+   - `QuizSubmitView` returns the report dictionary.
+   - Django passes the response to the `CustomRenderer`, which envelopes it and returns it to the user.
+========================================================================
